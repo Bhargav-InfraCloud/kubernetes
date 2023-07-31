@@ -25,6 +25,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -589,14 +591,42 @@ func NewStreamVisitor(r io.Reader, mapper *mapper, source string, schema Content
 // Visit implements Visitor over a stream. StreamVisitor is able to distinct multiple resources in one stream.
 func (v *StreamVisitor) Visit(fn VisitorFunc) error {
 	d := yaml.NewYAMLOrJSONDecoder(v.Reader, 4096)
+	var offset uint
+
 	for {
 		ext := runtime.RawExtension{}
-		if err := d.Decode(&ext); err != nil {
+		lineCount, err := d.Decode(&ext)
+		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
-			return fmt.Errorf("error parsing %s: %v", v.Source, err)
+
+			// Actual error when parsing the current resource errored-out
+			wrappedErr := fmt.Errorf("error parsing %s: %v", v.Source, err)
+
+			//
+			if yamlErrLineNum := lineNumberInYAMLErr(err); yamlErrLineNum != -1 {
+				wrappedErr = fmt.Errorf("error parsing %s at line %d: %v",
+					// YAML file name. Note: This step will only be executed
+					// when it is a YAML file. Else, yamlErrLineNum will
+					// be -1 and this error will be skipped.
+					v.Source,
+					// Offset + yamlErrLineNum, where the offset is the
+					// aggregation of the number of lines in each resource
+					// in the multi-resource YAML file; and yamlErrLineNum
+					// is the erroneous line's number.
+					offset+uint(yamlErrLineNum),
+					// The YAML error. This will still have the error with
+					// the line number w.r.t to the sub-resource in t
+					// multi-resource YAML file.
+					// See issue #104607 for more details.
+					err,
+				)
+			}
+
+			return wrappedErr
 		}
+
 		// TODO: This needs to be able to handle object in other encodings and schemas.
 		ext.Raw = bytes.TrimSpace(ext.Raw)
 		if len(ext.Raw) == 0 || bytes.Equal(ext.Raw, []byte("null")) {
@@ -615,6 +645,10 @@ func (v *StreamVisitor) Visit(fn VisitorFunc) error {
 		if err := fn(info, nil); err != nil {
 			return err
 		}
+
+		// Add line count of current resource +1 for separator
+		// line `---` to total vertical offset
+		offset += lineCount + 1
 	}
 }
 
@@ -767,4 +801,28 @@ func (infos InfoListVisitor) Visit(fn VisitorFunc) error {
 		err = fn(i, err)
 	}
 	return err
+}
+
+// lineNumberInYAMLErr matches the error message using
+// regex and returns the line number in YAML format error
+// if found. Else, it returns -1. It should be -1 if
+// a JSON file format error is sent.
+func lineNumberInYAMLErr(err error) int {
+	re := regexp.MustCompile(`(yaml: line )([0-9]+)(:)`)
+
+	// All matches: 1 full match + 3 group-wise match substrings
+	matches := re.FindStringSubmatch(err.Error())
+	if len(matches) < 4 {
+		return -1
+	}
+
+	// Match 0 is the full match of pattern. Matches 1 to 3
+	// are respective group matches in pattern, in which,
+	// match-2 is the line number string. Parse it as int.
+	line, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return -1
+	}
+
+	return line
 }

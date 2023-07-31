@@ -116,22 +116,23 @@ func NewYAMLToJSONDecoder(r io.Reader) *YAMLToJSONDecoder {
 	}
 }
 
-// Decode reads a YAML document as JSON from the stream or returns
-// an error. The decoding rules match json.Unmarshal, not
-// yaml.Unmarshal.
-func (d *YAMLToJSONDecoder) Decode(into interface{}) error {
-	bytes, err := d.reader.Read()
+// Decode reads a YAML document as JSON from the stream and returns
+// the line count, or returns an error. The decoding rules match
+// json.Unmarshal, not yaml.Unmarshal.
+func (d *YAMLToJSONDecoder) Decode(into interface{}) (uint, error) {
+	b, err := d.reader.Read()
 	if err != nil && err != io.EOF {
-		return err
+		return 0, err
 	}
 
-	if len(bytes) != 0 {
-		err := yaml.Unmarshal(bytes, into)
+	if len(b) != 0 {
+		err := yaml.Unmarshal(b, into)
 		if err != nil {
-			return YAMLSyntaxError{err}
+			return 0, YAMLSyntaxError{err}
 		}
 	}
-	return err
+
+	return uint(bytes.Count(b, []byte("\n"))), err
 }
 
 // YAMLDecoder reads chunks of objects and returns ErrShortBuffer if
@@ -231,7 +232,7 @@ func splitYAMLDocument(data []byte, atEOF bool) (advance int, token []byte, err 
 
 // decoder is a convenience interface for Decode.
 type decoder interface {
-	Decode(into interface{}) error
+	Decode(into interface{}) (uint, error)
 }
 
 // YAMLOrJSONDecoder attempts to decode a stream of JSON documents or
@@ -272,24 +273,25 @@ func NewYAMLOrJSONDecoder(r io.Reader, bufferSize int) *YAMLOrJSONDecoder {
 }
 
 // Decode unmarshals the next object from the underlying stream into the
-// provide object, or returns an error.
-func (d *YAMLOrJSONDecoder) Decode(into interface{}) error {
+// provide object and returns the line count, or returns an error.
+func (d *YAMLOrJSONDecoder) Decode(into interface{}) (uint, error) {
 	if d.decoder == nil {
 		buffer, _, isJSON := GuessJSONStream(d.r, d.bufferSize)
 		if isJSON {
-			d.decoder = json.NewDecoder(buffer)
+			d.decoder = NewJSONDecoder(buffer)
 		} else {
 			d.decoder = NewYAMLToJSONDecoder(buffer)
 		}
 	}
-	err := d.decoder.Decode(into)
+
+	lineCount, err := d.decoder.Decode(into)
 	if syntax, ok := err.(*json.SyntaxError); ok {
-		return JSONSyntaxError{
+		return 0, JSONSyntaxError{
 			Offset: syntax.Offset,
 			Err:    syntax,
 		}
 	}
-	return err
+	return lineCount, err
 }
 
 type Reader interface {
@@ -394,4 +396,43 @@ func hasJSONPrefix(buf []byte) bool {
 func hasPrefix(buf []byte, prefix []byte) bool {
 	trim := bytes.TrimLeftFunc(buf, unicode.IsSpace)
 	return bytes.HasPrefix(trim, prefix)
+}
+
+// JSONDecoder is a wrapper over (encoding/json).Decoder
+// with additional return value "lineCount" to implement
+// the decoder interface
+type JSONDecoder struct {
+	decoder *json.Decoder
+}
+
+// NewJSONDecoder returns new JSONDecoder which is a wrapper
+// over (encoding/json).Decoder with additional return value
+// "lineCount" to implement the decoder interface
+func NewJSONDecoder(r io.Reader) *JSONDecoder {
+	return &JSONDecoder{
+		decoder: json.NewDecoder(r),
+	}
+}
+
+// Decode decodes the JSON document from the stream, into the
+// input argument and returns the line count of the document,
+// or returns an error. This method is a wrapper over the
+// (encoding/json).Decoder.Decode method with additional
+// return value: lineCount.
+// 
+// The lineCount (uint) is always 0 as it is added for the
+// sake of implementing the decoder interface. In YAMLDecoder,
+// this value is required for logging the exact line number
+// format error when there is more than one resource in the
+// same YAML file. See issue #104607 for more details.
+// However, JSONDecoder parses all resources in the file
+// together and gives the exact line number in case of format
+// issues. Hence, this value can be ignored.
+func (j *JSONDecoder) Decode(into interface{}) (uint, error) {
+	err := j.decoder.Decode(into)
+	if err != nil {
+		return 0, err
+	}
+
+	return 0, nil
 }
